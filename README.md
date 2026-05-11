@@ -693,7 +693,3 @@ Two practical points are worth noting:
 If you use this repository, please cite the associated manuscript.
 
 ---
-
-## License
-
-Add the repository license here.
