@@ -57,6 +57,7 @@ Typical output files
 """
 
 import argparse
+import random
 import os
 import re
 import json
@@ -79,6 +80,58 @@ from tasks import TASK_REGISTRY, BaseTask, get_task
 
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import Data
+
+
+def _set_experiment_seed(seed: Optional[int], deterministic: bool = False) -> None:
+    """Seed initialization, dropout, batching and graph sampling; opt-in only."""
+    if seed is not None:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+    if deterministic:
+        # The repeat launcher sets this before starting Python/CUDA as well.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        # Fail on unsupported nondeterministic operations instead of claiming
+        # reproducibility that this backend cannot provide.
+        torch.use_deterministic_algorithms(True)
+
+
+def _save_prediction_rows(out_dir: str, split: str, summary: Dict[str, Any],
+                          dataset, indices=None) -> None:
+    """Use the same non-shuffled dataset order as the final evaluation loader."""
+    if indices is None:
+        indices = range(len(dataset))
+    indices = list(indices)
+    if len(indices) != len(summary["y_true"]):
+        raise RuntimeError(f"{split}: window metadata/prediction length mismatch")
+    rows = []
+    for position, index in enumerate(indices):
+        names = dataset.groups[index]
+        last = torch.load(dataset._disk_paths[names[-1]], map_location="cpu", weights_only=False)
+        first = torch.load(dataset._disk_paths[names[0]], map_location="cpu", weights_only=False)
+        sid, day = getattr(last, "sim_id", None), getattr(last, "day", None)
+        if sid is None or day is None or str(getattr(first, "sim_id", "")) != str(sid):
+            raise RuntimeError(f"{split}: missing or inconsistent trajectory metadata")
+        row = {"sim_id": str(sid), "day": int(day), "start_day": int(first.day),
+               "last_file": names[-1], "y": int(summary["y_true"][position]),
+               "prediction": int(summary["y_pred"][position])}
+        probs = summary["probabilities"][position]
+        row.update({f"probability_class_{i}": float(p) for i, p in enumerate(probs)})
+        if len(probs) == 2:
+            row["probability"] = float(probs[1])
+        rows.append(row)
+    if rows:
+        path = Path(out_dir) / f"{split}_predictions.csv"
+        tmp = path.with_suffix(".csv.tmp")
+        with tmp.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, path)
 
 
 def _safe_cpu_count() -> int:
@@ -597,6 +650,10 @@ def _classification_split_summary(
         "y_pred": preds.tolist(),
         "probabilities": probs.tolist(),
     }
+    if task.out_dim == 2:
+        tn, fp, fn, tp = cm.ravel()
+        out["metrics"]["sensitivity"] = float(tp / (tp + fn)) if tp + fn else None
+        out["metrics"]["specificity"] = float(tn / (tn + fp)) if tn + fp else None
     return out
 
 
@@ -2271,6 +2328,17 @@ def main():
     parser.add_argument("--emit_translational_figures", type=str2bool, default=True, help="Export translational attribution figures.")
     parser.add_argument("--fullgraph_attribution_pass", type=str2bool, default=True, help="When training uses neighbor sampling, export translational figures and attention heatmaps from a separate full-graph inference pass.")
     parser.add_argument("--translational_top_k", type=int, default=20, help="Top-K staff/nodes to include in translational attribution rankings.")
+    parser.add_argument("--model_seed", type=int, default=None,
+                        help="Opt-in RNG seed for model initialization, dropout and sampling.")
+    parser.add_argument("--eval_seed", type=int, default=None,
+                        help="Reset sampling RNG before each final split evaluation.")
+    parser.add_argument("--deterministic", type=str2bool, default=False)
+    parser.add_argument("--evaluate_train", type=str2bool, default=False,
+                        help="Evaluate the final checkpoint on its actual fitted training subset.")
+    parser.add_argument("--export_predictions", type=str2bool, default=False,
+                        help="Write predictions with trajectory/day identifiers for cluster CIs.")
+    parser.add_argument("--metrics_only", type=str2bool, default=False,
+                        help="Skip attention/attribution exports after writing metrics.")
     parser.add_argument("--split_seed", type=int, default=0)
     parser.add_argument("--use_task_hparams", action="store_true")
 
@@ -2311,6 +2379,7 @@ def main():
     parser.add_argument("--lr_scheduler_min_lr", type=float, default=1e-6)
 
     args = parser.parse_args()
+    _set_experiment_seed(args.model_seed, bool(args.deterministic))
     args.data_folder = os.path.abspath(args.data_folder)
     if args.test_folder is not None:
         args.test_folder = os.path.abspath(args.test_folder)
@@ -2752,6 +2821,21 @@ def main():
         state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
 
+    if args.eval_seed is not None:
+        # Fresh final loaders make sampling reproducible in fit and evaluation-only
+        # processes even when persistent training workers had already been started.
+        val_loader = DataLoader(
+            val_set, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_temporal_graph_batch, num_workers=args.num_workers,
+            persistent_workers=False,
+        )
+        if test_dataset is not None:
+            test_loader = DataLoader(
+                test_dataset, batch_size=args.batch_size, shuffle=False,
+                collate_fn=collate_temporal_graph_batch, num_workers=args.num_workers,
+                persistent_workers=False,
+            )
+    _set_experiment_seed(args.eval_seed)
     _, _, val_y_hat_all, val_graphs_list, val_labels_all = eval_epoch(
         model=model,
         task=task,
@@ -2771,6 +2855,7 @@ def main():
     test_labels_all = None
 
     if test_loader is not None:
+        _set_experiment_seed(args.eval_seed)
         _, _, test_y_hat_all, test_graphs_list, test_labels_all = eval_epoch(
             model=model,
             task=task,
@@ -2811,6 +2896,12 @@ def main():
             "seed_strategy": str(args.seed_strategy),
             "seed_batch_size": int(args.seed_batch_size),
             "max_sub_batches": int(args.max_sub_batches),
+            "model_seed": args.model_seed,
+            "eval_seed": args.eval_seed,
+            "deterministic": bool(args.deterministic),
+            "evaluate_train": bool(args.evaluate_train),
+            "export_predictions": bool(args.export_predictions),
+            "metrics_only": bool(args.metrics_only),
             "split_seed": int(args.split_seed),
             "train_model": bool(args.train_model),
             "emit_translational_figures": bool(args.emit_translational_figures),
@@ -2984,7 +3075,48 @@ def main():
             plt.savefig(os.path.join(out_dir, "roc_curve_test.png"), dpi=600, bbox_inches="tight")
             plt.close()
 
+    if args.evaluate_train:
+        if not task.is_classification:
+            raise ValueError("--evaluate_train currently supports classification tasks only")
+        # Evaluation uses eval(), no dropout, no shuffle, and the selected final
+        # checkpoint. These are resubstitution metrics, never validation metrics.
+        train_eval_loader = DataLoader(
+            train_set, batch_size=args.batch_size, shuffle=False,
+            collate_fn=collate_temporal_graph_batch, num_workers=args.num_workers,
+            persistent_workers=_persistent_workers_enabled(args.num_workers),
+        )
+        _set_experiment_seed(args.eval_seed)
+        _, _, train_hat, train_graphs, train_labels = eval_epoch(
+            model=model, task=task, loader=train_eval_loader, device=device,
+            max_neighbors=args.max_neighbors, neighbor_sampling=args.neighbor_sampling,
+            num_neighbors=args.num_neighbors, seed_count=args.seed_count,
+            seed_strategy=args.seed_strategy, max_sub_batches=args.max_sub_batches,
+            seed_batch_size=args.seed_batch_size, progress_prefix="TRAIN_EVAL",
+        )
+        train_true = task.get_targets(train_graphs, train_labels).cpu().numpy().astype(int).reshape(-1)
+        train_probs = F.softmax(train_hat, dim=1).cpu().numpy()
+        run_summary["train"] = _classification_split_summary(
+            task, train_true, train_probs, train_probs.argmax(axis=1), class_names,
+        )
+        del train_hat, train_graphs, train_labels
+
+    if args.export_predictions:
+        if not task.is_classification:
+            raise ValueError("--export_predictions currently supports classification tasks only")
+        if "train" in run_summary:
+            _save_prediction_rows(out_dir, "train", run_summary["train"], dataset, train_indices)
+        _save_prediction_rows(out_dir, "validation", run_summary["validation"], dataset, val_indices)
+        if "test" in run_summary:
+            _save_prediction_rows(out_dir, "test", run_summary["test"], test_dataset)
+        run_summary["partition_trajectories"] = {
+            "train": sorted(set(sim_ids) - val_sims), "validation": sorted(val_sims),
+        }
+
     _write_run_summary_files(out_dir=out_dir, summary=run_summary)
+    if args.metrics_only:
+        print(f"Metrics and checkpoint saved to {out_dir}", flush=True)
+        return
+
 
     # -------------------------------------------------------------------------
     # RESTORED: Attention heatmaps (node attention vs performance)

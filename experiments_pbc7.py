@@ -2868,8 +2868,8 @@ def _latex_translational_figures_for_pages(*, track_name: str, step_tag: str, pn
                 lines.append(r"  \hfill")
             else:
                 lines.append(r"  \vspace{0.7em}")
-        lines.append(f"  \caption{{{caption}}}")
-        lines.append(f"  \label{{fig:{label}}}")
+        lines.append(fr"  \caption{{{caption}}}")
+        lines.append(fr"  \label{{fig:{label}}}")
         lines.append(r"\end{figure}")
         lines.append("")
     return lines
@@ -3351,6 +3351,14 @@ def _build_train_args_from_config(
     "--lr_scheduler_patience", str(int(model_cfg.get("lr_scheduler_patience", 3))),
     "--lr_scheduler_min_lr", str(float(model_cfg.get("lr_scheduler_min_lr", 1e-6))),
 ]
+
+    # New controls are passed only when explicitly supplied (legacy defaults unchanged).
+    for key in ("model_seed", "eval_seed", "split_seed"):
+        if model_cfg.get(key) is not None:
+            args += [f"--{key}", str(int(model_cfg[key]))]
+    for key in ("deterministic", "evaluate_train", "export_predictions", "metrics_only"):
+        if key in model_cfg:
+            args += [f"--{key}", "true" if bool(model_cfg[key]) else "false"]
 
     train_model_effective = bool(model_cfg.get("train_model", True)) if train_model_override is None else bool(train_model_override)
     train_flag = "true" if train_model_effective else "false"
@@ -6792,6 +6800,10 @@ def run_pipeline_once(
 # =============================================================================
 
 def main() -> int:
+    # Optional revision workflow: legacy invocations retain the original path.
+    if "--predictive_repeats" in sys.argv[1:]:
+        from predictive_repeats import main as repeat_main
+        return repeat_main([x for x in sys.argv[1:] if x != "--predictive_repeats"])
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", type=str, default="1")
     ap.add_argument("--stop", type=str, default="9")
