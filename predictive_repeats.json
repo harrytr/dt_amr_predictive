@@ -1,0 +1,23 @@
+{
+  "description": "Five joint independent predictive repeats; Steps 4, 8 and 9; T=7/H=7. Exploratory local parameter sensitivity, not calibrated parameter uncertainty.",
+  "simulation_seed_offsets": [100000, 200000, 300000, 400000, 500000],
+  "model_seeds": [202601, 202602, 202603, 202604, 202605],
+  "parameter_seed": 202607,
+  "parameter_multipliers": {
+    "resistant_transmission": [0.9, 1.1],
+    "resistant_admission_weights": [0.9, 1.1],
+    "turnover": [0.9, 1.1]
+  },
+  "parameter_rationale": "Explicit example design: independent uniform multipliers within +/-10% of each original regime setting provide a modest local sensitivity check while preserving canonical and shifted regime definitions. This is an exploratory perturbation distribution, not an empirical confidence distribution. Edit these ranges before the first run if scientifically justified ranges are available. The same draw is applied to all train/test families and observation tracks within each repeat; the three factors vary jointly across repeats.",
+  "split_seed": 0,
+  "tracks": ["ground_truth", "partial_observation"],
+  "include_xgboost": true,
+  "bootstrap_replicates": 1000,
+  "bootstrap_seed": 202609,
+  "deterministic": true,
+  "threads": 4,
+  "loader_workers": 0,
+  "conversion_workers": 4,
+  "keep_raw_graphml": false,
+  "model_overrides": {}
+}
